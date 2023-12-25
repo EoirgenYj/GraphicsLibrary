@@ -1,0 +1,178 @@
+#pragma kernel CullingMain
+#include <HLSLSupport.cginc>
+uint thread_count;//最大线程的数量
+uint original_depth_size;//原始深度图大小
+uint obj_total_count;//所有要处理的obj数量
+StructuredBuffer<float4x4> object_matrix_buffer;//所有物体的M矩阵
+bool is_opengl;//是否是OpenGL的API
+
+uniform float4 camera_frustum_planes[6];
+
+float4x4 camera_vp_matrix;//相机的VP矩阵
+Texture2D hiz_texture_2d;//HIZ纹理
+struct object_flag
+{
+    float3 bound_min;
+    float3 bound_max;
+    int object_id;
+};
+
+RWStructuredBuffer<object_flag> object_flag_buffer;//所有物体的结构体
+
+
+//平面方程
+bool IsOutSidePlane(float4 plane, float3 position)
+{
+    return dot(plane.xyz, position) + plane.w < 0;
+}
+
+
+bool IsAABBOutSidePlane(float4 plane,float3 boundsMin,float3 boundsMax){
+    return IsOutSidePlane(plane,boundsMin) &&
+    IsOutSidePlane(plane,boundsMax) &&
+    IsOutSidePlane(plane,float3(boundsMin.x,boundsMin.y,boundsMax.z)) &&
+    IsOutSidePlane(plane,float3(boundsMin.x,boundsMax.y,boundsMin.z)) &&
+    IsOutSidePlane(plane,float3(boundsMin.x,boundsMax.y,boundsMax.z)) &&
+    IsOutSidePlane(plane,float3(boundsMax.x,boundsMin.y,boundsMax.z)) &&
+    IsOutSidePlane(plane,float3(boundsMax.x,boundsMax.y,boundsMin.z)) &&
+    IsOutSidePlane(plane,float3(boundsMax.x,boundsMin.y,boundsMin.z));
+}
+
+bool IsBoundsOutSidePlane(float4 plane,float3 boundsMin,float3 boundsMax){
+    return IsAABBOutSidePlane(plane,boundsMin,boundsMax);
+}
+
+//视锥裁剪
+bool FrustumCull(float4 planes[6],float3 boundsMin,float3 boundsMax){
+    return IsBoundsOutSidePlane(planes[0],boundsMin,boundsMax) || 
+    IsBoundsOutSidePlane(planes[1],boundsMin,boundsMax) || 
+    IsBoundsOutSidePlane(planes[2],boundsMin,boundsMax) || 
+    IsBoundsOutSidePlane(planes[3],boundsMin,boundsMax) || 
+    IsBoundsOutSidePlane(planes[4],boundsMin,boundsMax) || 
+    IsBoundsOutSidePlane(planes[5],boundsMin,boundsMax);
+}
+
+int GetObjectReverseID(int object_id)
+{
+    return -(object_id + 1);   
+}
+
+//通过线程组id计算出object的ID
+[numthreads(8, 8, 1)]
+void CullingMain(uint3 gid : SV_GroupID, uint index : SV_GroupIndex)
+{
+    const uint obj_index = gid.x * thread_count + index;
+    if (obj_index >= obj_total_count) return;
+
+    const object_flag flag = object_flag_buffer[obj_index];
+    
+    const float4x4 object_matrix = object_matrix_buffer[obj_index];
+    const float4x4 mvp_matrix = mul(camera_vp_matrix, object_matrix);
+    
+    // float4 bound_verts[8];
+    //
+    // bound_verts[0] = float4(flag.bound_min, 1);
+    // bound_verts[1] = float4(flag.bound_max, 1);
+    // bound_verts[2] = float4(flag.bound_max.x, flag.bound_max.y, flag.bound_min.z, 1);
+    // bound_verts[3] = float4(flag.bound_max.x, flag.bound_min.y, flag.bound_max.z, 1);
+    // bound_verts[4] = float4(flag.bound_max.x, flag.bound_min.y, flag.bound_min.z, 1);
+    // bound_verts[5] = float4(flag.bound_min.x, flag.bound_max.y, flag.bound_max.z, 1);
+    // bound_verts[6] = float4(flag.bound_min.x, flag.bound_max.y, flag.bound_min.z, 1);
+    // bound_verts[7] = float4(flag.bound_min.x, flag.bound_min.y, flag.bound_max.z, 1);
+
+    float min_x = 1, min_y = 1, min_z = 1, max_x = -1, max_y = -1, max_z = -1;
+    //-------------------------------------------------------视椎剔除-------------------------------------------------------
+    //通过mvp矩阵得到顶点的Clip Space的齐次坐标，然后在Clip Space做视椎剔除判断，所有点都不在NDC内就被剔除。
+    const bool is_out_plane = FrustumCull(camera_frustum_planes, flag.bound_min, flag.bound_max);
+    if (is_out_plane)
+    {
+        object_flag_buffer[obj_index].object_id = GetObjectReverseID(flag.object_id);
+    }
+    
+    // UNITY_UNROLL
+    //     for (int i = 0; i < 8; i++)
+    //     {
+    //         float4 clipSpace = mul(mvp_matrix, bound_verts[i]);
+    //         if (!is_in_clip_space && IsInClip(clipSpace))
+    //             is_in_clip_space = true;
+    //
+    //         //计算该草ndc下的AABB
+    //         float3 ndc = clipSpace.xyz / clipSpace.w;
+    //         if (min_x > ndc.x) min_x = ndc.x;
+    //         if (min_y > ndc.y) min_y = ndc.y;
+    //         if (min_z > ndc.z) min_z = ndc.z;
+    //         if (max_x < ndc.x) max_x = ndc.x;
+    //         if (max_y < ndc.y) max_y = ndc.y;
+    //         if (max_z < ndc.z) max_z = ndc.z;
+    //     }
+    // if (!is_in_clip_space)
+    // {
+    //     object_flag_buffer[obj_index].object_id = GetObjectReverseID(object_flag_buffer[obj_index].object_id);
+    //     return;
+    // }
+        
+    // //-------------------------------------------------------Hiz遮挡剔除-------------------------------------------------------    
+    // //ndc的AABB的左下角和右上角的uv坐标，ndc的-1转换为uv的0到1；
+    // float2 uv_left_bottom = float2(min_x, min_y) * 0.5f + 0.5f;
+    // float2 uv_right_top = float2(max_x, max_y) * 0.5f + 0.5f;
+    // //DX下NDC的z值即为深度（因为MVP变换后是反转过来的，所以要取最大的那个值）
+    // float depth = max_z;
+    // //如果是OpenGL，首先要取最小的那个z值，然后需要*0.5+0.5，转换到0-1的深度值
+    // if (is_opengl) depth = min_z * 0.5f + 0.5f;
+    //
+    // //计算应该取哪层mipmap
+    // const uint mipmap_level = (uint)clamp(original_depth_size * 2 / log2(max(max_x - min_x, max_y - min_y)), 0, log2(original_depth_size) - 4);
+    // //当前mipmap的大小
+    // const uint size = original_depth_size / (1 << mipmap_level);
+    //
+    // //左下角和右上角点所在的像素
+    // uint2 pixel_left_bottom = uint2(clamp(uv_left_bottom.x * size, 0, size - 1), clamp(uv_left_bottom.y * size, 0, size - 1));
+    // uint2 pixel_right_top = uint2(clamp(uv_right_top.x * size, 0, size - 1), clamp(uv_right_top.y * size, 0, size - 1));
+    //
+    // //采样对应深度图的对应像素的深度值，并做比较
+    // //我们选择对NDC空间下的模型再次建立新的包围盒，用这个包围盒去做保守剔除。
+    // float depth_in_texture = hiz_texture_2d.mips[mipmap_level][pixel_left_bottom].r;
+    // //如果左下的点都小于右上的点，则取右上为深度
+    // const float max_depth_r_t = hiz_texture_2d.mips[mipmap_level][pixel_right_top].r;
+    // const float max_depth_lx_ry = hiz_texture_2d.mips[mipmap_level][int2(pixel_left_bottom.x, pixel_right_top.y)].r;
+    // const float max_depth_rx_ly = hiz_texture_2d.mips[mipmap_level][int2(pixel_right_top.x, pixel_left_bottom.y)].r;
+    //
+    // if (is_opengl)
+    // {
+    //     if (pixel_left_bottom.x < pixel_right_top.x && pixel_left_bottom.y < pixel_right_top.y)
+    //     {
+    //         depth_in_texture = max(max(depth_in_texture, max_depth_r_t), max(max_depth_lx_ry, max_depth_rx_ly));
+    //     }
+    //     else if (pixel_left_bottom.x < pixel_right_top.x)
+    //     {
+    //         depth_in_texture = max(depth_in_texture, max_depth_rx_ly);
+    //     }
+    //     else if (pixel_left_bottom.y < pixel_right_top.y)
+    //     {
+    //         depth_in_texture = max(depth_in_texture, max_depth_lx_ry);
+    //     }
+    //     if (depth_in_texture < depth)
+    //     {
+    //         object_flag_buffer[obj_index].object_id = GetObjectReverseID(object_flag_buffer[obj_index].object_id);
+    //     }
+    // }
+    // else
+    // {
+    //     if (pixel_left_bottom.x < pixel_right_top.x && pixel_left_bottom.y < pixel_right_top.y)
+    //     {
+    //         depth_in_texture = min(min(depth_in_texture, max_depth_r_t), min(max_depth_lx_ry, max_depth_rx_ly));
+    //     }
+    //     else if (pixel_left_bottom.x < pixel_right_top.x)
+    //     {
+    //         depth_in_texture = min(depth_in_texture, max_depth_rx_ly);
+    //     }
+    //     else if (pixel_left_bottom.y < pixel_right_top.y)
+    //     {
+    //         depth_in_texture = min(depth_in_texture, max_depth_lx_ry);
+    //     }
+    //     if (depth_in_texture > depth)
+    //     {
+    //         object_flag_buffer[obj_index].object_id = GetObjectReverseID(object_flag_buffer[obj_index].object_id);
+    //     }
+    // }
+}
