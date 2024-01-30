@@ -8,3 +8,6 @@ Based On https://github.com/ecidevilin/UnityMeshSimplify
 ## branch: **HizCulling**
 A simple module to HizCulling used DepthMipMap&ComputeShader
 Based On [https://github.com/ecidevilin/UnityMeshSimplify](https://github.com/luckyWjr/ComputeShaderDemo/tree/master/Assets/OcclusionCulling/Hiz) & [https://github.com/wlgys8/GPUDrivenTerrainLearn](https://github.com/wlgys8/GPUDrivenTerrainLearn.git)
+
+## branch : **ShaderBaseLearn**
+A book note for Unity Shader Learn
